@@ -1,0 +1,19 @@
+# Data (too large for GitHub — see README for download instructions)
+*.csv
+*.parquet
+
+# Trained models
+*.pkl
+*.joblib
+
+# Generated outputs
+*.html
+
+# Python / Jupyter
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# OS
+.DS_Store

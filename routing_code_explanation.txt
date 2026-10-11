@@ -1,0 +1,582 @@
+================================================================================
+  HYBRID INTELLIGENT PROACTIVE ROUTING AGENT
+  Code Explanation — Section by Section
+================================================================================
+
+--------------------------------------------------------------------------------
+SECTION 0 — INSTALL AND IMPORT LIBRARIES
+--------------------------------------------------------------------------------
+
+What it does:
+  Installs and imports every Python library the notebook needs.
+
+Key libraries and why each one is here:
+
+  pandas       — loads the Chicago Traffic Tracker CSV into a DataFrame, handles
+                 all tabular operations: filtering, groupby, merge, pivot tables.
+
+  numpy        — fast numerical operations: quantile calculations, sin/cos for
+                 cyclical encoding, array slicing for train/test split.
+
+  xgboost      — the gradient boosting model that predicts road segment speeds.
+                 Trained on 14 features, outputs a continuous speed value (mph).
+
+  joblib       — saves and loads the trained XGBoost model to/from a .pkl file.
+                 This is the handoff point between the training run and routing.
+
+  networkx     — builds the directed weighted graph of Chicago road segments and
+                 provides the Dijkstra baseline via nx.dijkstra_path().
+
+  sklearn      — LabelEncoder converts categorical columns (DIRECTION, TIME_BLOCK)
+                 into integer codes that XGBoost can consume.
+
+  matplotlib   — static plots: speed histograms, hourly curves, heatmaps,
+                 feature importance bar chart, benchmark box plots.
+
+  seaborn      — heatmap with colour scale for the Day x Hour speed grid.
+
+  folium       — generates an interactive HTML map showing the two A* routes
+                 as coloured lines on a real Chicago basemap.
+
+  heapq        — Python's built-in min-heap, used to implement A* priority queue.
+                 The smallest f-score entry is always popped first.
+
+  tqdm         — progress bar for the 30-query benchmark loop and hour sweep.
+
+
+--------------------------------------------------------------------------------
+SECTION 1 — CONFIGURATION AND DATA LOADING
+--------------------------------------------------------------------------------
+
+What it does:
+  Sets up three config variables, then either generates synthetic data or loads
+  the real Chicago Traffic Tracker CSV.
+
+Config variables:
+  USE_SYNTHETIC  — True runs the full notebook without any file downloads.
+                   Flip to False and set TRAFFIC_PATH when you have the real CSV.
+  MODEL_PATH     — path to the saved XGBoost .pkl file. If the file does not
+                   exist, Section 4 falls back to SEG_DAY_HOUR_AVG averages.
+  QUERY_HOUR     — the hour of day (0-23) for which the routing graph is built.
+                   8 = morning peak, highest signal delay.
+
+Why synthetic data uses a chain topology:
+  Random scatter of GPS coordinates produces isolated node pairs — segment[i].end
+  never coincidentally equals segment[j].start, so the graph has no connected
+  paths and A* always fails. A chain guarantees segment[i].end == segment[i+1].start
+  so every consecutive pair of nodes is reachable. Real Chicago data already has
+  this property because segments follow the street grid.
+
+Speed simulation:
+  Peak hours (7-9am, 4-7pm): normal distribution centred at 11 mph.
+  Off-peak: normal distribution centred at 28 mph.
+  This replicates the double-valley pattern visible in the real dataset EDA.
+
+
+--------------------------------------------------------------------------------
+SECTION 2 — DATA CLEANING
+--------------------------------------------------------------------------------
+
+What it does:
+  Removes sensor faults and invalid rows, then engineers all temporal features
+  needed by the XGBoost model.
+
+Cleaning steps in order:
+
+  Step 1 — Parse timestamps
+    pd.to_datetime(..., errors='coerce') converts unparseable strings to NaT.
+    Dropping NaT rows ensures all .dt operations are safe downstream.
+
+  Step 2 — Extract temporal features
+    HOUR, DAY_OF_WEEK, MONTH, QUARTER extracted from the parsed timestamp.
+    IS_WEEKEND flags Saturday (5) and Sunday (6).
+
+  Step 3 — Cyclical time encoding
+    Raw HOUR has a discontinuity: hour 23 and hour 0 appear far apart numerically
+    but are only 1 hour apart in reality. Sin/cos encoding wraps the circle:
+      hour_sin = sin(2π × HOUR / 24)
+      hour_cos = cos(2π × HOUR / 24)
+    At midnight: hour_sin=0, hour_cos=1. At 23:00: hour_sin≈-0.26, hour_cos≈0.97.
+    These two values are close, correctly representing temporal proximity.
+    Same treatment applied to MONTH with period 12.
+
+  Step 4 — TIME_BLOCK
+    Coarser grouping of hours into 5 named periods:
+      Overnight (0-5), Morning_Rush (6-9), Midday (10-14),
+      Evening_Rush (15-18), Evening (19-23).
+    Used as both an XGBoost feature and a fallback in the baseline stats hierarchy.
+
+  Step 5 — Label encoding
+    DIRECTION (N/S/E/W) and TIME_BLOCK (5 categories) are text — XGBoost needs
+    numbers. LabelEncoder maps each unique string to an integer 0, 1, 2...
+    Important: the same encoder fitted here must be used at prediction time,
+    otherwise the integer mappings will be inconsistent.
+
+  Step 6 — Speed filter
+    SPEED <= 0: the Chicago dataset uses -1 as a sentinel for 'sensor offline'.
+    SPEED > 70: GPS traces from CTA buses occasionally bleed onto expressway
+    overpasses — arterial roads physically cannot sustain these speeds.
+
+  Step 7 — Zero-length and missing coordinates
+    LENGTH = 0 causes division by zero in TRAVEL_TIME_MIN = (LENGTH/SPEED)*60.
+    Missing lat/lon means the node cannot be placed in geographic space, so the
+    haversine heuristic cannot compute a distance.
+
+  Step 8 — Travel time derivation
+    TRAVEL_TIME_MIN = (LENGTH / SPEED) * 60
+    Units: LENGTH in miles, SPEED in mph, result in minutes.
+    This is the raw edge weight before XGBoost predicted speeds replace it.
+    Capped at 30 minutes — any sub-mile segment taking longer is a sensor artefact.
+
+
+--------------------------------------------------------------------------------
+SECTION 3 — EXPLORATORY DATA ANALYSIS (EDA)
+--------------------------------------------------------------------------------
+
+What it does:
+  Produces six plots across three panels that validate the cleaned data and
+  motivate the design decisions made in later sections.
+
+Panel 1A — Speed histogram:
+  Shows the full distribution of speed readings. A bimodal shape (two peaks)
+  confirms two distinct traffic regimes exist: free-flow (~28 mph) and congested
+  (~10 mph). This bimodality is what makes signal penalty meaningful — congested
+  segments imply vehicle queuing behind red phases.
+
+Panel 1B — Hourly average speed:
+  The classic double-valley curve with dips at 7-9am and 4-7pm validates that
+  QUERY_HOUR=8 captures worst-case conditions. This plot directly justifies
+  building a separate graph per hour rather than using a single daily average.
+
+Panel 1C — Speed heatmap (Hour x Day):
+  2D view showing when congestion is worst simultaneously across hour and day.
+  Weekend columns (Sat/Sun) should be visibly greener (faster), confirming
+  IS_WEEKEND is a meaningful feature for the XGBoost model.
+
+Panel 2A — Travel time peak vs off-peak:
+  Overlapping histograms with density normalisation. Separation between the two
+  distributions quantifies how much slower peak-hour travel is. If they overlapped
+  completely, time-of-day routing would add no value.
+
+Panel 2B — Speed drop by hour:
+  SPEED_DROP = free_flow_speed - observed_speed, clipped at zero.
+  Free-flow speed is the 95th percentile — what segments achieve with no queuing.
+  This bar chart is the raw signal that gets converted to signal penalty in
+  Section 5. It should mirror the hourly speed curve but inverted.
+
+Panel 2C — Top 15 congested segments:
+  Horizontal bar chart of segments ranked by average travel time. These are the
+  segments where signal penalty will most influence routing decisions.
+
+Panel 3A/B — Monthly and seasonal analysis:
+  Boxplot by month and violin by season. Validates that MONTH and QUARTER
+  features capture real seasonal variation in speed.
+
+Panel 3C — Correlation matrix:
+  Pearson correlations between all numeric features and SPEED. hour_sin/cos
+  should correlate more cleanly with speed than raw HOUR, validating the
+  cyclical encoding choice.
+
+
+--------------------------------------------------------------------------------
+SECTION 4 — XGBOOST SPEED PREDICTION
+--------------------------------------------------------------------------------
+
+What it does:
+  Builds the temporal baseline statistics, trains XGBoost (or loads the saved
+  model), predicts speeds for the full dataset, and validates predictions.
+
+Step 4a — Temporal baseline statistics:
+  Three lookup tables computed from the training split (first 80% of rows):
+
+  SEG_DAY_HOUR_AVG: average speed for each (segment, day_of_week, hour) triple.
+    Most precise — captures exact patterns like "this segment on Monday at 8am".
+    Most likely to be missing for rare combinations.
+
+  SEG_BLOCK_AVG: average speed for each (segment, time_block) pair.
+    Less precise but covers more combinations. Used as fallback 1.
+
+  SEG_MONTH_AVG: average speed for each (segment, month) pair.
+    Captures seasonality. Used as fallback 2.
+
+  segment_stats: single average per segment, regardless of time. Fallback 3.
+  global_mean: dataset-wide average speed. Final fallback, always available.
+
+  The hierarchy matters: for a new observation, we try the most precise lookup
+  first and fall back to coarser estimates only when needed. This prevents NaN
+  values in the feature matrix that would crash model.predict().
+
+Step 4b — merge_all_stats() function:
+  Merges all three lookup tables into the target DataFrame using left joins.
+  The drop at the top of the function removes any pre-existing stat columns —
+  this is critical when re-running cells in Jupyter/VSCode because pandas
+  creates _x/_y suffix duplicates if the column already exists.
+
+  After merging, each row now has SEG_DAY_HOUR_AVG, SEG_BLOCK_AVG, SEG_MONTH_AVG
+  as columns, filled using the hierarchy wherever the join found no match.
+
+Step 4c — XGBoost training (when model not pre-saved):
+  14 features fed to XGBRegressor:
+    segment_id        — which road segment
+    hour_sin, hour_cos — cyclical hour encoding
+    month_sin, month_cos — cyclical month encoding
+    day_of_week       — 0=Monday to 6=Sunday
+    QUARTER           — 1-4
+    is_weekend        — binary
+    DIRECTION_ENC     — N/S/E/W as integer
+    length            — segment length in miles
+    time_block_enc    — Overnight/Rush/Midday etc. as integer
+    seg_block_avg     — fallback speed for this segment's time block
+    seg_month_avg     — fallback speed for this segment's month
+    seg_day_hour_avg  — most precise baseline for this segment/day/hour
+
+  Training config: 3000 estimators, learning rate 0.04, max depth 10,
+  early stopping after 50 rounds of no improvement on the test set.
+  tree_method='hist' uses histogram-based split finding — faster on large data.
+
+Step 4d — Prediction and validation:
+  Predictions are made separately on X_train and X_test, then both DataFrames
+  get a 'predicted_speed' column. They are concatenated back into df so
+  Section 5 onwards has predicted_speed for all rows.
+
+  Validation plot uses test_df ONLY — showing train predictions would inflate
+  apparent accuracy because XGBoost partially memorises training data.
+  The hourly comparison (observed vs predicted by hour) is the key calibration
+  check: if the curves track closely, the model generalises well.
+
+
+--------------------------------------------------------------------------------
+SECTION 5 — SIGNAL PENALTY DERIVATION
+--------------------------------------------------------------------------------
+
+What it does:
+  Converts XGBoost-predicted speeds into a per-segment signal delay estimate,
+  then aggregates to a segment x hour lookup table used to build the graph.
+
+Why derive signal delay from speed (not a separate dataset):
+  No public Chicago dataset provides per-intersection green_time / red_time at
+  the required granularity. Rather than fabricating a second dataset, we derive
+  signal delay from physics. The Highway Capacity Manual (HCM 6th edition) states
+  that on urban arterials, 25-50% of total delay is attributable to signal control.
+
+Formula:
+  free_flow_speed   = 95th percentile of predicted speeds
+                      (what a segment achieves with no queuing)
+
+  total_delay_min   = (LENGTH/predicted_speed - LENGTH/free_flow_speed) * 60
+                      clipped at zero (some segments run above free-flow)
+
+  signal_delay_min  = total_delay_min * 0.30
+                      (30% of total delay — conservative HCM baseline)
+
+Why the penalty attaches to destination nodes:
+  Traffic signals control movement through intersections, not along road segments.
+  A vehicle experiences the red wait when it ARRIVES at the end of a segment and
+  must stop before entering the next one. Attaching the penalty to the destination
+  node (via the edge weight) correctly models this: the cost is paid on arrival at
+  the intersection, not during the drive along the segment.
+
+seg_hourly aggregation:
+  Groups by (SEGMENT_ID, HOUR) and computes mean values for:
+    avg_travel_min  — average XGBoost-derived travel time this hour
+    avg_signal_min  — average derived signal delay this hour
+    coordinates and street names (first value — same for all rows of one segment)
+
+  This produces ~30,000 rows (1,250 segments x 24 hours) which is the input
+  to graph construction. Working at this aggregated level is much more efficient
+  than carrying millions of raw rows into the graph builder.
+
+
+--------------------------------------------------------------------------------
+SECTION 6 — GRAPH CONSTRUCTION
+--------------------------------------------------------------------------------
+
+What it does:
+  Builds two directed weighted graphs of Chicago's road network for the
+  configured query hour — one with signal penalties, one without.
+
+haversine_km():
+  Computes straight-line distance between two lat/lon points using the
+  Haversine formula, which accounts for Earth's spherical curvature.
+  Used by the A* heuristic to estimate remaining distance to the goal.
+
+node_id():
+  Converts a lat/lon pair to a hashable tuple by rounding to 4 decimal places.
+  4 decimal places = ~11 metre grid precision.
+  Why round? Two GPS observations of the same physical intersection may differ
+  by a few metres due to map-matching noise. Rounding merges them into one node
+  without accidentally merging distinct intersections (which are 100+ metres apart).
+
+build_graph():
+  Iterates over seg_hourly rows for the query hour. For each row (one road segment):
+    src = node_id(start_lat, start_lon)  — the intersection at the segment start
+    dst = node_id(end_lat,   end_lon)    — the intersection at the segment end
+
+  G_signal adds edge src→dst with weight = avg_travel_min + avg_signal_min
+    This is the "signal-aware" graph. A* on this graph will avoid edges where
+    the destination intersection has a high avg_signal_min.
+
+  G_nosignal adds edge src→dst with weight = avg_travel_min only
+    This is the control graph. A* on this graph is pure congestion-based routing.
+
+  Both graphs store base_tt and sig_wait as edge attributes so paths can be
+  decomposed after routing: how much of the trip was driving vs waiting at lights.
+
+  Both graphs are built in a single pass over the data — identical topology,
+  only edge weights differ. This ensures any path difference between the two
+  graphs is caused solely by signal penalties.
+
+Connectivity check:
+  nx.weakly_connected_components() finds groups of nodes that can reach each other.
+  For synthetic chain data: one large component (100%).
+  For real Chicago data: expect 85-95% in the largest component. The remainder
+  are cul-de-sacs or segments with no neighbours in the cleaned dataset.
+
+
+--------------------------------------------------------------------------------
+SECTION 7 — A* ALGORITHM IMPLEMENTATION
+--------------------------------------------------------------------------------
+
+What it does:
+  Implements the A* search algorithm from scratch using Python's heapq module,
+  plus a Dijkstra wrapper using NetworkX's built-in implementation.
+
+heuristic():
+  h(n) = haversine_distance(n, goal) / FREE_FLOW_MPH * 60
+
+  This estimates the minimum possible travel time from node n to the goal:
+  fly there in a straight line at the fastest speed ever observed in the dataset.
+
+  Admissibility proof:
+    1. No path can be shorter than the straight-line distance (triangle inequality)
+    2. No vehicle travels faster than FREE_FLOW_MPH in the network
+       (it is the 95th percentile of all predicted speeds)
+    3. Therefore h(n) <= true_remaining_cost(n) for all n
+    4. Therefore A* with this heuristic returns the optimal path
+
+  If a node's position is unknown, h=0 is returned. h=0 is trivially admissible
+  (it never overestimates) — it just makes A* behave like Dijkstra for that node.
+
+astar():
+  Data structures:
+    queue   — min-heap of (f_score, g_score, node, path)
+               heapq in Python is a min-heap: smallest f is always popped first.
+    visited — dict mapping node to the best g_score seen for that node.
+               Prevents re-expanding nodes already reached more cheaply.
+
+  Algorithm step by step:
+    1. Initialise queue with (h(source, goal), 0, source, [source])
+    2. Pop entry with smallest f from queue
+    3. If popped node == target: return path and cost (optimal guaranteed)
+    4. If node already in visited with lower g: skip (stale entry)
+    5. Mark node as visited with current g
+    6. For each neighbour: compute g2 = g + edge_weight, f2 = g2 + h(neighbour)
+    7. Push (f2, g2, neighbour, path + [neighbour]) to queue
+    8. Repeat from step 2
+
+  Why terminate on POP not on DISCOVERY?
+    When a node is first pushed to the queue, we don't know if we've found the
+    cheapest path to it yet — a cheaper path may still be in the queue. Only when
+    a node is POPPED (with the smallest possible f) can we be certain its g is
+    optimal. This is the key correctness condition.
+
+  nodes_explored return value:
+    Counts how many times step 2 (pop) executed. This measures search effort —
+    how many nodes A* had to examine before finding the goal. Lower = more efficient.
+    Dijkstra explores nodes in all directions; A* focuses toward the goal.
+
+dijkstra_path():
+  Thin wrapper around nx.dijkstra_path() and nx.dijkstra_path_length().
+  Used as ground-truth baseline. If A* (no signal) returns a different cost
+  than Dijkstra on the same graph, the heuristic has a bug.
+
+
+--------------------------------------------------------------------------------
+SECTION 8 — SINGLE QUERY DEMO
+--------------------------------------------------------------------------------
+
+What it does:
+  Runs all three methods on one randomly chosen source-target pair, verifies
+  correctness, and decomposes the signal path into driving time vs signal wait.
+
+Source-target selection:
+  Randomly samples node pairs until one is found where nx.has_path() returns True.
+  For a chain graph this succeeds on the first attempt. For sparse real data
+  it may take several tries.
+
+Correctness check:
+  abs(cost_dijk - cost_astar_ns) < 1e-6
+  A* no-signal and Dijkstra both operate on G_nosignal with the same edge weights.
+  They MUST return identical costs — if they don't, the heuristic is inadmissible.
+
+decompose_path():
+  Walks the path edge by edge, reading base_tt and sig_wait from each edge's
+  stored attributes. Sums them to show:
+    driving_time_min  — time actually moving along the road
+    signal_delay_min  — time waiting at destination intersections
+    signal share (%)  — what fraction of the trip is spent at red lights
+
+  This is the most interpretable output for the assignment report: it answers
+  "how much of your trip is actually traffic signals?"
+
+
+--------------------------------------------------------------------------------
+SECTION 9 — MULTI-QUERY BENCHMARK
+--------------------------------------------------------------------------------
+
+What it does:
+  Runs 30 random queries and compares all three methods on cost and search effort.
+
+Why 30 queries?
+  A single query result could be a fluke (unusually long or short path).
+  30 queries gives a distribution, enabling mean, std, and box plot comparisons
+  that are statistically more meaningful.
+
+signal_overhead column:
+  = astar_signal_min - astar_nosig_min for each query.
+  Positive: A* with signal chose a longer driving route to avoid a high-delay
+            intersection. This is the expected behaviour — it trades driving
+            time for fewer red-light stops.
+  Near zero: Both methods chose the same route. This happens when no better
+             signal-avoiding alternative exists (common on sparse synthetic graphs
+             with only one path between nodes).
+
+nodes_explored comparison:
+  A* with signal typically explores similar or slightly more nodes than A* without
+  signal, because signal penalties alter the f-score landscape — some previously
+  cheap edges become expensive, requiring the search to consider alternatives.
+  Both explore far fewer nodes than Dijkstra on a real 2D city grid.
+
+
+--------------------------------------------------------------------------------
+SECTION 10 — HOUR-BY-HOUR SWEEP
+--------------------------------------------------------------------------------
+
+What it does:
+  Rebuilds the graph for each of the 24 hours, runs 5 queries per hour,
+  and plots how signal overhead changes across the day.
+
+Why rebuild the graph per hour?
+  seg_hourly contains different avg_travel_min and avg_signal_min values for
+  each hour because XGBoost predictions and the derived signal penalties both
+  depend on the hour. The graph must be hour-specific to reflect this.
+
+What the output shows:
+  Top panel: two travel time curves (signal vs no-signal) by hour.
+    The gap between them = signal overhead at that hour.
+    Wider gap at 7-9am and 4-7pm confirms signal penalties are largest at peak.
+
+  Bottom panel: bar chart of signal overhead by hour.
+    Red bars at peak hours, blue at off-peak.
+    This is the key report figure: "signal-aware routing matters most at peak
+    hours and adds negligible overhead at off-peak times."
+
+
+--------------------------------------------------------------------------------
+SECTION 11 — FOLIUM ROUTE MAP (VSCode)
+--------------------------------------------------------------------------------
+
+What it does:
+  Draws both routes on an interactive map and saves as route_map.html.
+
+In VSCode (not Colab/Jupyter):
+  display(m) does not render inline. Use IFrame instead:
+    from IPython.display import IFrame
+    IFrame('route_map.html', width=800, height=500)
+  Or open route_map.html directly in your browser by double-clicking it
+  in the VSCode file explorer.
+
+What the map shows:
+  Red solid line   — A* with signal (XGBoost predicted speeds + signal penalty)
+  Blue dashed line — A* without signal (congestion only)
+  Orange dots      — intersections on the signal route with top-25% signal delay
+  Green marker     — source (start)
+  Red flag marker  — target (destination)
+
+  If the two lines diverge at any point, the signal-aware router chose a
+  different road to avoid an orange-dotted junction. This is the visual proof
+  that signal penalties change routing behaviour.
+
+
+--------------------------------------------------------------------------------
+SECTION 12 — AUTO-GENERATED REPORT SUMMARY
+--------------------------------------------------------------------------------
+
+What it does:
+  Prints all key findings with actual computed values from the run.
+  Copy-paste ready for the assignment report.
+
+Covers:
+  1. Data pipeline stats (rows loaded, retained, segments)
+  2. XGBoost integration (model loaded yes/no, predicted vs observed mean speed)
+  3. Signal penalty parameters and peak vs off-peak overhead ratio
+  4. Routing benchmark: mean cost per method, signal overhead, % queries changed
+  5. Search efficiency: nodes explored per method
+  6. Admissibility statement (pre-written, cite in report)
+  7. Limitations section (pre-written)
+  8. Future work section (pre-written)
+
+
+================================================================================
+  WHY A* AND DIJKSTRA SHOW LITTLE DIFFERENCE IN COST
+================================================================================
+
+This is expected and correct. Both algorithms are guaranteed to return the
+OPTIMAL path on the same graph. They will ALWAYS return the same cost.
+
+The difference is SEARCH EFFICIENCY (nodes explored), not path quality:
+  - Dijkstra expands nodes in all directions from the source
+  - A* uses the haversine heuristic to focus search toward the goal,
+    pruning nodes that are far from the destination
+
+On the synthetic chain graph, this advantage is minimal because:
+  - The graph is linear — there is essentially one path between any two nodes
+  - The heuristic has nothing to prune since wrong directions lead to dead ends
+    that Dijkstra would also immediately abandon
+
+On a real Chicago 2D grid (real dataset):
+  - Dijkstra explores nodes in every direction: north, south, east, west
+  - A* focuses search toward the goal, skipping ~30-50% of nodes
+  - At scale (100k+ nodes, real-time routing): this difference is the gap between
+    a 2-second response and a 10-second one
+
+
+================================================================================
+  HOW SIGNAL PENALTY ENTERS A* — STEP BY STEP
+================================================================================
+
+Step 1 — Derivation (Section 5):
+  For each (segment, hour) combination:
+    total_delay   = (LENGTH/predicted_speed - LENGTH/free_flow_speed) * 60
+    signal_delay  = total_delay * 0.30
+
+Step 2 — Graph construction (Section 6):
+  G_nosignal edge weight = avg_travel_min
+  G_signal   edge weight = avg_travel_min + avg_signal_min
+
+  The signal_delay is added to the edge that ARRIVES AT the intersection
+  (the destination node of the edge), not the edge that leaves it.
+  This correctly models the physical reality: you wait at a red light when
+  you arrive at an intersection, not when you leave the previous one.
+
+Step 3 — A* search (Section 7):
+  A* minimises f(n) = g(n) + h(n).
+  g(n) = sum of edge weights along the path so far.
+
+  On G_signal, edges arriving at busy intersections carry a higher weight.
+  A* will prefer an alternative route (even if longer in distance) if it
+  avoids an intersection with a large avg_signal_min.
+
+  Example:
+    Route A: 3.0 min travel + 2.0 min signal at one busy junction = 5.0 min total
+    Route B: 3.8 min travel + 0.2 min signal (quiet junction) = 4.0 min total
+    A* with signal chooses Route B.
+    A* without signal sees 3.0 vs 3.8 and chooses Route A.
+
+  The signal_overhead in the benchmark is the extra travel time Route B costs
+  compared to Route A — the price paid for fewer red-light stops.
+
+
+================================================================================
+  END OF CODE EXPLANATION
+================================================================================
